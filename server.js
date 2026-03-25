@@ -9,6 +9,7 @@ const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const path = require('path');
+const dns = require('dns').promises;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -423,10 +424,19 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
       `
     };
 
-    // Render/network environments can time out on one SMTP mode; try STARTTLS (587) first, then SSL (465)
+    // Resolve Gmail SMTP to IPv4 first (some cloud networks have broken IPv6 SMTP routing)
+    let smtpHost = 'smtp.gmail.com';
+    try {
+      const ipv4 = await dns.resolve4('smtp.gmail.com');
+      if (ipv4?.length) smtpHost = ipv4[0];
+    } catch (e) {
+      // Fallback to hostname if DNS lookup fails
+    }
+
+    // Try STARTTLS (587) first, then SSL (465)
     const smtpModes = [
-      { host: 'smtp.gmail.com', port: 587, secure: false, requireTLS: true },
-      { host: 'smtp.gmail.com', port: 465, secure: true }
+      { host: smtpHost, port: 587, secure: false, requireTLS: true },
+      { host: smtpHost, port: 465, secure: true }
     ];
 
     let sent = false;
@@ -437,7 +447,6 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
         const transporter = nodemailer.createTransport({
           ...mode,
           auth: { user: smtpUser, pass: smtpPass },
-          family: 4,
           connectionTimeout: 30000,
           greetingTimeout: 15000,
           socketTimeout: 30000,
