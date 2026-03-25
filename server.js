@@ -9,7 +9,6 @@ const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const path = require('path');
-const dns = require('dns').promises;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -177,6 +176,8 @@ if (count.c === 0) {
 const insSettingDefault = db.prepare("INSERT OR IGNORE INTO host_settings VALUES (?, ?)");
 insSettingDefault.run('gmail_user', '');
 insSettingDefault.run('gmail_app_password', '');
+insSettingDefault.run('resend_api_key', '');
+insSettingDefault.run('resend_from_email', 'onboarding@resend.dev');
 
 // ── Helpers ─────────────────────────────────────────────────
 const COLORS = ['#0d9488','#6366f1','#f59e0b','#ec4899','#14b8a6','#8b5cf6','#f97316','#06b6d4'];
@@ -377,28 +378,16 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
   const b = db.prepare('SELECT * FROM bookings WHERE id = ?').get(req.params.id);
   if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
 
-  // Get Gmail credentials from settings
+  // Get email credentials from settings
   const gmailUser = db.prepare("SELECT value FROM host_settings WHERE key='gmail_user'").get()?.value;
   const gmailPass = db.prepare("SELECT value FROM host_settings WHERE key='gmail_app_password'").get()?.value;
+  const resendApiKey = db.prepare("SELECT value FROM host_settings WHERE key='resend_api_key'").get()?.value;
+  const resendFromEmail = db.prepare("SELECT value FROM host_settings WHERE key='resend_from_email'").get()?.value || 'onboarding@resend.dev';
   const propertyName = db.prepare("SELECT value FROM host_settings WHERE key='property_name'").get()?.value || 'StayBook';
 
-  const smtpUser = String(gmailUser || '').trim();
-  // Users often paste Gmail app password with spaces: "xxxx xxxx xxxx xxxx"
-  const smtpPass = String(gmailPass || '').trim().replace(/\s+/g, '');
-
-  if (!smtpUser || !smtpPass) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Gmail not configured. Go to Settings → add your Gmail address and App Password first.' 
-    });
-  }
-
   try {
-    const mailOptions = {
-      from: `"${propertyName}" <${smtpUser}>`,
-      to: b.guest_email,
-      subject: `${propertyName} — Please fill out your guest form`,
-      html: `
+    const subject = `${propertyName} — Please fill out your guest form`;
+    const html = `
         <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px">
           <h2 style="color:#0d9488;margin-bottom:4px">Hello ${b.guest_name}! 👋</h2>
           <p style="color:#475569;font-size:15px;line-height:1.6">
@@ -421,48 +410,51 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
           </div>
           <p style="color:#94a3b8;font-size:12px;margin-top:24px">Sent via StayBook</p>
         </div>
-      `
-    };
+      `;
 
-    // Resolve Gmail SMTP to IPv4 first (some cloud networks have broken IPv6 SMTP routing)
-    let smtpHost = 'smtp.gmail.com';
-    try {
-      const lookedUp = await dns.lookup('smtp.gmail.com', { family: 4 });
-      if (lookedUp?.address) smtpHost = lookedUp.address;
-    } catch (e) {
-      // Fallback to hostname if DNS lookup fails
-    }
+    const useResend = String(resendApiKey || '').trim().length > 0;
+    if (useResend) {
+      const rr = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${String(resendApiKey).trim()}`
+        },
+        body: JSON.stringify({
+          from: `"${propertyName}" <${String(resendFromEmail).trim() || 'onboarding@resend.dev'}>`,
+          to: [b.guest_email],
+          subject,
+          html
+        })
+      });
 
-    // Try STARTTLS (587) first, then SSL (465)
-    const smtpModes = [
-      { host: smtpHost, port: 587, secure: false, requireTLS: true },
-      { host: smtpHost, port: 465, secure: true }
-    ];
-
-    let sent = false;
-    let lastErr = null;
-
-    for (const mode of smtpModes) {
-      try {
-        const transporter = nodemailer.createTransport({
-          ...mode,
-          auth: { user: smtpUser, pass: smtpPass },
-          connectionTimeout: 30000,
-          greetingTimeout: 15000,
-          socketTimeout: 30000,
-          tls: { servername: 'smtp.gmail.com' }
-        });
-
-        await transporter.sendMail(mailOptions);
-        sent = true;
-        break;
-      } catch (err) {
-        lastErr = err;
-        console.warn(`⚠️ SMTP send failed on port ${mode.port}:`, err.message);
+      if (!rr.ok) {
+        const errText = await rr.text();
+        throw new Error(`Resend error (${rr.status}): ${errText}`);
       }
-    }
+    } else {
+      const smtpUser = String(gmailUser || '').trim();
+      const smtpPass = String(gmailPass || '').trim().replace(/\s+/g, '');
 
-    if (!sent) throw lastErr || new Error('SMTP send failed');
+      if (!smtpUser || !smtpPass) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email not configured. In Settings, add Resend API key (recommended) or Gmail address + App Password.'
+        });
+      }
+
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: smtpUser, pass: smtpPass }
+      });
+
+      await transporter.sendMail({
+      from: `"${propertyName}" <${smtpUser}>`,
+      to: b.guest_email,
+      subject,
+      html
+      });
+    }
 
     // Update DB after successful send
     const now = new Date().toISOString();
@@ -475,7 +467,7 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
     console.error('❌ Email send error:', err.message);
     res.status(500).json({ 
       success: false, 
-      message: `Email failed: ${err.message}. Check your Gmail credentials in Settings.` 
+      message: `Email failed: ${err.message}. On Render, use Resend API key in Settings (recommended).` 
     });
   }
 });

@@ -643,6 +643,16 @@ async function tabSettings() {
     </div>
     <div class="setting-card">
       <div class="setting-row">
+        <div class="setting-label">Resend API Key (Recommended on Render)</div>
+        <div class="setting-sub">Create key at resend.com/api-keys. Works over HTTPS (more reliable than SMTP on cloud hosts).</div>
+        <input class="setting-input" id="s-resend-key" type="password" placeholder="re_..." value="${s.resend_api_key||''}">
+      </div>
+      <div class="setting-row">
+        <div class="setting-label">Resend From Email</div>
+        <div class="setting-sub">Use verified sender/domain in Resend. Default: onboarding@resend.dev</div>
+        <input class="setting-input" id="s-resend-from" type="email" placeholder="onboarding@resend.dev" value="${s.resend_from_email||'onboarding@resend.dev'}">
+      </div>
+      <div class="setting-row">
         <div class="setting-label">Gmail Address</div>
         <div class="setting-sub">The Gmail address emails will be sent from</div>
         <input class="setting-input" id="s-gmail" type="email" placeholder="yourname@gmail.com" value="${s.gmail_user||''}">
@@ -668,6 +678,8 @@ async function saveSettings() {
     property_name:document.getElementById('s-prop').value,
     price_per_night:document.getElementById('s-price').value,
     google_form_link:document.getElementById('s-form').value,
+    resend_api_key:document.getElementById('s-resend-key').value,
+    resend_from_email:document.getElementById('s-resend-from').value,
     gmail_user:document.getElementById('s-gmail').value,
     gmail_app_password:document.getElementById('s-gmail-pass').value
   });
