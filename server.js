@@ -430,7 +430,23 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
 
       if (!rr.ok) {
         const errText = await rr.text();
-        throw new Error(`Resend error (${rr.status}): ${errText}`);
+        let resendMsg = `Resend error (${rr.status})`;
+        try {
+          const parsed = JSON.parse(errText);
+          resendMsg = parsed?.message || resendMsg;
+        } catch (_) {
+          // keep fallback message
+        }
+
+        if (String(resendMsg).includes('You can only send testing emails')) {
+          throw new Error('Resend test mode: send only to your Resend account email, or verify a domain at resend.com/domains and use that sender.');
+        }
+
+        if (String(resendMsg).includes('domain is not verified')) {
+          throw new Error('Resend sender domain is not verified. Verify domain at resend.com/domains, then use a sender from that domain.');
+        }
+
+        throw new Error(resendMsg);
       }
     } else {
       const smtpUser = String(gmailUser || '').trim();
@@ -467,7 +483,7 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
     console.error('❌ Email send error:', err.message);
     res.status(500).json({ 
       success: false, 
-      message: `Email failed: ${err.message}. On Render, use Resend API key in Settings (recommended).` 
+      message: `Email failed: ${err.message}` 
     });
   }
 });
