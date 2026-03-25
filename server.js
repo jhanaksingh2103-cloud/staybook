@@ -427,8 +427,8 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
     // Resolve Gmail SMTP to IPv4 first (some cloud networks have broken IPv6 SMTP routing)
     let smtpHost = 'smtp.gmail.com';
     try {
-      const ipv4 = await dns.resolve4('smtp.gmail.com');
-      if (ipv4?.length) smtpHost = ipv4[0];
+      const lookedUp = await dns.lookup('smtp.gmail.com', { family: 4 });
+      if (lookedUp?.address) smtpHost = lookedUp.address;
     } catch (e) {
       // Fallback to hostname if DNS lookup fails
     }
