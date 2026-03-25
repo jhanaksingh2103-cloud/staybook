@@ -381,7 +381,11 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
   const gmailPass = db.prepare("SELECT value FROM host_settings WHERE key='gmail_app_password'").get()?.value;
   const propertyName = db.prepare("SELECT value FROM host_settings WHERE key='property_name'").get()?.value || 'StayBook';
 
-  if (!gmailUser || !gmailPass) {
+  const smtpUser = String(gmailUser || '').trim();
+  // Users often paste Gmail app password with spaces: "xxxx xxxx xxxx xxxx"
+  const smtpPass = String(gmailPass || '').trim().replace(/\s+/g, '');
+
+  if (!smtpUser || !smtpPass) {
     return res.status(400).json({ 
       success: false, 
       message: 'Gmail not configured. Go to Settings → add your Gmail address and App Password first.' 
@@ -389,13 +393,8 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: gmailUser, pass: gmailPass }
-    });
-
-    await transporter.sendMail({
-      from: `"${propertyName}" <${gmailUser}>`,
+    const mailOptions = {
+      from: `"${propertyName}" <${smtpUser}>`,
       to: b.guest_email,
       subject: `${propertyName} — Please fill out your guest form`,
       html: `
@@ -422,7 +421,38 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
           <p style="color:#94a3b8;font-size:12px;margin-top:24px">Sent via StayBook</p>
         </div>
       `
-    });
+    };
+
+    // Render/network environments can time out on one SMTP mode; try STARTTLS (587) first, then SSL (465)
+    const smtpModes = [
+      { host: 'smtp.gmail.com', port: 587, secure: false, requireTLS: true },
+      { host: 'smtp.gmail.com', port: 465, secure: true }
+    ];
+
+    let sent = false;
+    let lastErr = null;
+
+    for (const mode of smtpModes) {
+      try {
+        const transporter = nodemailer.createTransport({
+          ...mode,
+          auth: { user: smtpUser, pass: smtpPass },
+          connectionTimeout: 30000,
+          greetingTimeout: 15000,
+          socketTimeout: 30000,
+          tls: { servername: 'smtp.gmail.com' }
+        });
+
+        await transporter.sendMail(mailOptions);
+        sent = true;
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`⚠️ SMTP send failed on port ${mode.port}:`, err.message);
+      }
+    }
+
+    if (!sent) throw lastErr || new Error('SMTP send failed');
 
     // Update DB after successful send
     const now = new Date().toISOString();
