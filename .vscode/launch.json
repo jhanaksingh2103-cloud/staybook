@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "▶ Start StayBook Server",
+      "program": "${workspaceFolder}/server.js",
+      "console": "integratedTerminal",
+      "restart": true,
+      "env": {
+        "PORT": "3001"
+      }
+    }
+  ]
+}

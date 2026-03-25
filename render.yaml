@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: staybook
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_PATH
+        value: /var/data/staybook.db
+    disks:
+      - name: staybook-data
+        mountPath: /var/data
+        sizeGB: 1
