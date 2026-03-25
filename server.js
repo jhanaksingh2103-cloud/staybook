@@ -437,6 +437,7 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
         const transporter = nodemailer.createTransport({
           ...mode,
           auth: { user: smtpUser, pass: smtpPass },
+          family: 4,
           connectionTimeout: 30000,
           greetingTimeout: 15000,
           socketTimeout: 30000,
