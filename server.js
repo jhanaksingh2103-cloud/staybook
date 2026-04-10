@@ -176,8 +176,6 @@ if (count.c === 0) {
 const insSettingDefault = db.prepare("INSERT OR IGNORE INTO host_settings VALUES (?, ?)");
 insSettingDefault.run('gmail_user', '');
 insSettingDefault.run('gmail_app_password', '');
-insSettingDefault.run('resend_api_key', '');
-insSettingDefault.run('resend_from_email', 'onboarding@resend.dev');
 
 // ── Helpers ─────────────────────────────────────────────────
 const COLORS = ['#0d9488','#6366f1','#f59e0b','#ec4899','#14b8a6','#8b5cf6','#f97316','#06b6d4'];
@@ -347,15 +345,93 @@ app.post('/api/bookings', requireAuth, (req, res) => {
 // PATCH /api/bookings/:id
 app.patch('/api/bookings/:id', requireAuth, (req, res) => {
   const { id } = req.params;
-  if (!db.prepare('SELECT id FROM bookings WHERE id = ?').get(id))
+  const existing = db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
+  if (!existing)
     return res.status(404).json({ success: false, message: 'Not found' });
 
-  const allowed = ['status','host_notes','form_link','guest_name','guest_email','guest_phone','amount'];
+  const allowed = [
+    'status','host_notes','form_link',
+    'guest_name','guest_email','guest_phone',
+    'check_in','check_out','check_in_time','check_out_time',
+    'guests','amount'
+  ];
   const updates = {};
   allowed.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
   if (!Object.keys(updates).length)
     return res.status(400).json({ success: false, message: 'Nothing to update' });
 
+  const merged = {
+    ...existing,
+    ...updates
+  };
+
+  const requiredFields = {
+    guest_name: merged.guest_name,
+    guest_email: merged.guest_email,
+    guest_phone: merged.guest_phone,
+    check_in: merged.check_in,
+    check_out: merged.check_out,
+    check_in_time: merged.check_in_time,
+    check_out_time: merged.check_out_time,
+    guests: merged.guests,
+    amount: merged.amount
+  };
+
+  const missingFields = Object.entries(requiredFields)
+    .filter(([, v]) => v === undefined || v === null || String(v).trim() === '')
+    .map(([k]) => k);
+
+  if (missingFields.length) {
+    return res.status(400).json({
+      success: false,
+      message: `Missing required fields: ${missingFields.join(', ')}`
+    });
+  }
+
+  const parsedAmount = parseInt(merged.amount, 10);
+  if (Number.isNaN(parsedAmount) || parsedAmount <= 0)
+    return res.status(400).json({ success: false, message: 'Amount is required and must be greater than 0' });
+
+  const parsedGuests = parseInt(merged.guests, 10);
+  if (Number.isNaN(parsedGuests) || parsedGuests <= 0)
+    return res.status(400).json({ success: false, message: 'Guests is required and must be greater than 0' });
+
+  const checkInDateTime = new Date(`${merged.check_in}T${merged.check_in_time}`);
+  const checkOutDateTime = new Date(`${merged.check_out}T${merged.check_out_time}`);
+  if (checkOutDateTime <= checkInDateTime) {
+    return res.status(400).json({
+      success: false,
+      message: 'Check-out must be after check-in'
+    });
+  }
+
+  // Check overlap against other bookings (exclude current booking id)
+  const overlap = db.prepare(`
+    SELECT guest_name, check_in, check_out, check_in_time, check_out_time FROM bookings
+    WHERE status != 'cancelled'
+      AND id != ?
+      AND NOT (
+        (check_out < ? OR (check_out = ? AND check_out_time <= ?)) OR
+        (check_in > ? OR (check_in = ? AND check_in_time >= ?))
+      )
+    LIMIT 1
+  `).get(id, merged.check_in, merged.check_in, merged.check_in_time, merged.check_out, merged.check_out, merged.check_out_time);
+
+  if (overlap) {
+    const overlapCheckIn = `${overlap.check_in} ${overlap.check_in_time}`;
+    const overlapCheckOut = `${overlap.check_out} ${overlap.check_out_time}`;
+    return res.status(409).json({
+      success: false,
+      message: `Booking conflicts with ${overlap.guest_name} (${overlapCheckIn} to ${overlapCheckOut})`
+    });
+  }
+
+  updates.amount = parsedAmount;
+  updates.guests = parsedGuests;
+  updates.nights = Math.max(1, Math.ceil((new Date(merged.check_out) - new Date(merged.check_in)) / 86400000));
+  if (updates.guest_name !== undefined) {
+    updates.initials = getInitials(String(merged.guest_name));
+  }
   updates.updated_at = new Date().toISOString();
   const set = Object.keys(updates).map(k => `${k} = @${k}`).join(', ');
   db.prepare(`UPDATE bookings SET ${set} WHERE id = @id`).run({ ...updates, id });
@@ -378,16 +454,29 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
   const b = db.prepare('SELECT * FROM bookings WHERE id = ?').get(req.params.id);
   if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
 
-  // Get email credentials from settings
+  // Get Gmail credentials from settings
   const gmailUser = db.prepare("SELECT value FROM host_settings WHERE key='gmail_user'").get()?.value;
   const gmailPass = db.prepare("SELECT value FROM host_settings WHERE key='gmail_app_password'").get()?.value;
-  const resendApiKey = db.prepare("SELECT value FROM host_settings WHERE key='resend_api_key'").get()?.value;
-  const resendFromEmail = db.prepare("SELECT value FROM host_settings WHERE key='resend_from_email'").get()?.value || 'onboarding@resend.dev';
   const propertyName = db.prepare("SELECT value FROM host_settings WHERE key='property_name'").get()?.value || 'StayBook';
 
+  if (!gmailUser || !gmailPass) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Gmail not configured. Go to Settings → add your Gmail address and App Password first.' 
+    });
+  }
+
   try {
-    const subject = `${propertyName} — Please fill out your guest form`;
-    const html = `
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: gmailUser, pass: gmailPass }
+    });
+
+    await transporter.sendMail({
+      from: `"${propertyName}" <${gmailUser}>`,
+      to: b.guest_email,
+      subject: `${propertyName} — Please fill out your guest form`,
+      html: `
         <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px">
           <h2 style="color:#0d9488;margin-bottom:4px">Hello ${b.guest_name}! 👋</h2>
           <p style="color:#475569;font-size:15px;line-height:1.6">
@@ -410,67 +499,8 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
           </div>
           <p style="color:#94a3b8;font-size:12px;margin-top:24px">Sent via StayBook</p>
         </div>
-      `;
-
-    const useResend = String(resendApiKey || '').trim().length > 0;
-    if (useResend) {
-      const rr = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${String(resendApiKey).trim()}`
-        },
-        body: JSON.stringify({
-          from: `"${propertyName}" <${String(resendFromEmail).trim() || 'onboarding@resend.dev'}>`,
-          to: [b.guest_email],
-          subject,
-          html
-        })
-      });
-
-      if (!rr.ok) {
-        const errText = await rr.text();
-        let resendMsg = `Resend error (${rr.status})`;
-        try {
-          const parsed = JSON.parse(errText);
-          resendMsg = parsed?.message || resendMsg;
-        } catch (_) {
-          // keep fallback message
-        }
-
-        if (String(resendMsg).includes('You can only send testing emails')) {
-          throw new Error('Resend test mode: send only to your Resend account email, or verify a domain at resend.com/domains and use that sender.');
-        }
-
-        if (String(resendMsg).includes('domain is not verified')) {
-          throw new Error('Resend sender domain is not verified. Verify domain at resend.com/domains, then use a sender from that domain.');
-        }
-
-        throw new Error(resendMsg);
-      }
-    } else {
-      const smtpUser = String(gmailUser || '').trim();
-      const smtpPass = String(gmailPass || '').trim().replace(/\s+/g, '');
-
-      if (!smtpUser || !smtpPass) {
-        return res.status(400).json({
-          success: false,
-          message: 'Email not configured. In Settings, add Resend API key (recommended) or Gmail address + App Password.'
-        });
-      }
-
-      const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: smtpUser, pass: smtpPass }
-      });
-
-      await transporter.sendMail({
-      from: `"${propertyName}" <${smtpUser}>`,
-      to: b.guest_email,
-      subject,
-      html
-      });
-    }
+      `
+    });
 
     // Update DB after successful send
     const now = new Date().toISOString();
@@ -483,9 +513,44 @@ app.post('/api/bookings/:id/send-form', requireAuth, async (req, res) => {
     console.error('❌ Email send error:', err.message);
     res.status(500).json({ 
       success: false, 
-      message: `Email failed: ${err.message}` 
+      message: `Email failed: ${err.message}. Check your Gmail credentials in Settings.` 
     });
   }
+});
+
+// POST /api/bookings/:id/send-whatsapp
+app.post('/api/bookings/:id/send-whatsapp', requireAuth, (req, res) => {
+  const { form_link } = req.body;
+  if (!form_link) return res.status(400).json({ success: false, message: 'form_link required' });
+
+  const b = db.prepare('SELECT * FROM bookings WHERE id = ?').get(req.params.id);
+  if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+  const rawPhone = String(b.guest_phone || '').trim();
+  if (!rawPhone) {
+    return res.status(400).json({ success: false, message: 'Guest phone number not found' });
+  }
+
+  // Keep digits only; WhatsApp expects country code + number without symbols
+  let phone = rawPhone.replace(/\D/g, '');
+  if (phone.length === 10) phone = `91${phone}`; // default to India country code for local numbers
+  if (phone.length < 11) {
+    return res.status(400).json({ success: false, message: 'Invalid guest phone number for WhatsApp' });
+  }
+
+  const propertyName = db.prepare("SELECT value FROM host_settings WHERE key='property_name'").get()?.value || 'StayBook';
+  const message = `Hi ${b.guest_name}, please fill your guest form for ${propertyName}: ${form_link}`;
+  const whatsappUrl = `https://wa.me/${phone}?text=${encodeURIComponent(message)}`;
+
+  const now = new Date().toISOString();
+  db.prepare("UPDATE bookings SET form_link=?, form_sent=1, form_sent_at=?, updated_at=? WHERE id=?")
+    .run(form_link, now, now, req.params.id);
+
+  res.json({
+    success: true,
+    message: 'WhatsApp link ready',
+    data: { whatsapp_url: whatsappUrl }
+  });
 });
 
 // POST /api/submit-form/:booking_id  ← PUBLIC webhook (Google Form posts here)
@@ -558,6 +623,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   PATCH  /api/bookings/:id`);
   console.log(`   DELETE /api/bookings/:id`);
   console.log(`   POST   /api/bookings/:id/send-form`);
+  console.log(`   POST   /api/bookings/:id/send-whatsapp`);
   console.log(`   POST   /api/submit-form/:booking_id  ← Google Forms webhook`);
   console.log(`   GET    /api/stats`);
   console.log(`   GET    /api/settings\n`);

@@ -2,3 +2,6 @@ node_modules/
 staybook.db
 .env
 *.log
+.DS_Store
+*.db-wal
+*.db-shm

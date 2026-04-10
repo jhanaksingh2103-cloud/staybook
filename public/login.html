@@ -88,6 +88,27 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:linear-gradien
 <script>
 const API_URL = window.location.origin;
 
+(async function bootstrapLogin() {
+  const token = localStorage.getItem('staybook_token');
+  if (!token) return;
+
+  try {
+    const response = await fetch(`${API_URL}/api/auth/verify`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (response.ok) {
+      window.location.href = '/app';
+    } else {
+      localStorage.removeItem('staybook_token');
+      localStorage.removeItem('staybook_user');
+    }
+  } catch (_) {
+    localStorage.removeItem('staybook_token');
+    localStorage.removeItem('staybook_user');
+  }
+})();
+
 document.getElementById('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   
